@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import os
@@ -30,13 +31,14 @@ class LaneFollowNode(Node):
         self.bridge = CvBridge()
 
         # =========================
-        # YOLO
+        # YOLO model
         # =========================
         self.model_path = os.path.expanduser('~/lane_models/best.pt')
         self.yolo_model = None
         self.use_yolo = True
         self.yolo_conf = 0.35
         self.yolo_imgsz = 640
+
         self.yolo_every_n = 2
         self.frame_id = 0
         self.cached_yolo_mask = None
@@ -54,7 +56,7 @@ class LaneFollowNode(Node):
             self.get_logger().info('YOLO model loaded.')
 
         # =========================
-        # State
+        # State machine
         # =========================
         self.state = 'ACQUIRE'
 
@@ -62,8 +64,10 @@ class LaneFollowNode(Node):
         self.acquire_need_count = 6
         self.acquire_error_gate = 90.0
         self.acquire_max_pair_error = 280.0
+        self.reacquire_center_gate = 170.0
+
         self.track_lost_count = 0
-        self.max_track_lost_count = 12
+        self.max_track_lost_count = 8
 
         # =========================
         # PID
@@ -85,17 +89,11 @@ class LaneFollowNode(Node):
         # =========================
         # Speed
         # =========================
-        self.fast_speed = 3.00
-        self.base_speed = 2.40
-        self.min_speed = 0.70
-        self.acquire_speed_limit = 1.20
-        self.safe_single_speed_floor = 1.80
-
-        # lost search speed
-        self.lost_speed_1 = 0.65
-        self.lost_speed_2 = 0.55
-        self.lost_speed_3 = 0.45
-        self.lost_speed_4 = 0.30
+        self.fast_speed = 2.05
+        self.base_speed = 1.50
+        self.min_speed = 0.45
+        self.acquire_speed_limit = 0.65
+        self.lost_speed = 0.18
 
         # =========================
         # Lane geometry
@@ -107,64 +105,45 @@ class LaneFollowNode(Node):
         self.lane_center_est = None
         self.had_lane_lock = False
 
-        # Historical own-lane anchors.
-        # Only reliable two-line pair updates these.
-        self.last_left_x = None
-        self.last_right_x = None
-        self.last_left_slope = None
-        self.last_right_slope = None
+        self.single_line_gate = 280.0
+        self.single_ambiguous_margin = 10.0
+        self.single_error_gate = 360.0
+        self.single_steer_gate = 0.70
+        self.safe_single_speed_floor = 2.10
+        self.max_center_jump = 260.0
 
-        # Gates for anti-adjacent-lane logic.
-        self.reacquire_center_gate = 110.0
-        self.pair_anchor_gate = 125.0
-        self.single_anchor_gate = 120.0
-        self.single_slope_gate = 1.50
-        self.max_single_abs_slope = 4.2
-        self.single_line_gate = 300.0
-        self.single_ambiguous_margin = 8.0
-        self.max_center_jump = 230.0
+        # Line-contact guard:
+        # If a yellow lane line appears too close to the image center at the bottom,
+        # the car is probably pressing the lane line. Force steer away from it.
+        self.contact_ratio = 0.32
+        self.warning_ratio = 0.44
+        self.contact_steer = 0.38
+        self.warning_steer = 0.22
+        self.contact_speed_limit = 0.55
+        self.warning_speed_limit = 0.95
 
-        # Locked center update. Single-line does NOT update lock.
-        self.lock_update_max_step = 25.0
+        # Line-contact guard:
+        # If a yellow lane line appears too close to the image center at the bottom,
+        # the car is probably pressing the lane line. Force steer away from it.
+        self.contact_ratio = 0.32
+        self.warning_ratio = 0.44
+        self.contact_steer = 0.38
+        self.warning_steer = 0.22
+        self.contact_speed_limit = 0.55
+        self.warning_speed_limit = 0.95
 
-        # =========================
-        # Curve debug / bias
-        # =========================
-        # Keep curve bias OFF for now.
-        # Adjacent-lane hairpins are easier to keep stable without bias.
-        self.curve_bias_enable = False
-        self.curve_bias_px = 0.0
-        self.last_curve_print_time = 0.0
-        self.curve_print_interval = 0.35
-
-        # =========================
-        # Line contact guard
-        # =========================
-        self.contact_ratio = 0.28
-        self.warning_ratio = 0.40
-        self.contact_steer = 0.26
-        self.warning_steer = 0.12
-        self.contact_speed_limit = 1.20
-        self.warning_speed_limit = 2.20
-
-        # =========================
         # Lost search
-        # =========================
         self.lost_count = 0
         self.search_dir = 1.0
         self.last_search_flip_time = time.time()
 
-        # =========================
         # Save image
-        # =========================
         self.latest_frame = None
         self.image_count = 0
         self.save_dir = os.path.expanduser('~/lane_dataset/images')
         os.makedirs(self.save_dir, exist_ok=True)
 
-        # =========================
-        # ROS
-        # =========================
+        # ROS topics
         self.cmd_pub = self.create_publisher(AckermannDrive, '/ackermann_cmd', 10)
         self.vis_pub = self.create_publisher(Image, '/lane_follow/vis', 10)
         self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
@@ -172,23 +151,22 @@ class LaneFollowNode(Node):
         self.timer = self.create_timer(0.02, self.keyboard_loop)
 
         print('')
-        print('========== Clean YOLO + OpenCV + PID Lane Follow ==========')
+        print('========== YOLO + OpenCV + PID Lane Follow ==========')
         print(f'Model path : {self.model_path}')
         print(f'YOLO mode  : {self.use_yolo}')
         print('State      : ACQUIRE -> TRACK -> ACQUIRE')
-        print('ACQUIRE    : must see TWO lane lines')
-        print('TRACK      : pair first, safe single fallback second')
-        print('Anti-change: pair and single both checked by own-lane anchors')
-        print('Curve bias : OFF')
-        print('SPACE      : save image')
+        print('ACQUIRE    : must see TWO lines and center car')
+        print('TRACK      : two lines preferred, safe single-line fallback allowed')
+        print('Anti-change: keep locked center when reacquiring')
+        print('SPACE      : save current camera image')
         print('q          : quit')
         print('Vis topic  : /lane_follow/vis')
         print('Cmd topic  : /ackermann_cmd')
-        print('===========================================================')
+        print('=====================================================')
         print('')
 
     # ============================================================
-    # Keyboard / ROS
+    # ROS / keyboard
     # ============================================================
     def publish_cmd(self, speed, steer):
         msg = AckermannDrive()
@@ -234,7 +212,7 @@ class LaneFollowNode(Node):
             print(f'[SAVED] {filename}')
             self.image_count += 1
         else:
-            print(f'[FAILED] {filename}')
+            print(f'[FAILED] Could not save image: {filename}')
 
     def draw_text(self, img, text, x, y, color=(0, 255, 0), scale=0.55, thick=2):
         cv2.putText(
@@ -248,7 +226,7 @@ class LaneFollowNode(Node):
         )
 
     # ============================================================
-    # Mask
+    # Mask generation
     # ============================================================
     def make_road_roi(self, h, w):
         mask = np.zeros((h, w), dtype=np.uint8)
@@ -278,7 +256,7 @@ class LaneFollowNode(Node):
 
         mask = cv2.bitwise_or(mask_hsv, mask_lab)
 
-        # Remove grass
+        # filter green grass
         lower_green = np.array([35, 35, 35])
         upper_green = np.array([90, 255, 255])
         green_mask = cv2.inRange(hsv, lower_green, upper_green)
@@ -303,13 +281,13 @@ class LaneFollowNode(Node):
         if not self.use_yolo or self.yolo_model is None:
             return np.zeros((h, w), dtype=np.uint8), 0
 
-        run_now = (
+        run_yolo_now = (
             self.cached_yolo_mask is None or
             self.cached_yolo_mask.shape[:2] != (h, w) or
             self.frame_id % self.yolo_every_n == 0
         )
 
-        if not run_now:
+        if not run_yolo_now:
             return self.cached_yolo_mask.copy(), self.cached_yolo_count
 
         yolo_mask = np.zeros((h, w), dtype=np.uint8)
@@ -384,22 +362,22 @@ class LaneFollowNode(Node):
         return final_mask, yellow_mask, yolo_mask, info
 
     # ============================================================
-    # Component extraction
+    # Components
     # ============================================================
     def extract_components(self, mask, y1, y2):
         roi = mask[y1:y2, :]
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(roi, 8)
 
         comps = []
-        roi_h = max(y2 - y1, 1)
 
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
             bx = stats[i, cv2.CC_STAT_LEFT]
-            by_local = stats[i, cv2.CC_STAT_TOP]
-            by = by_local + y1
+            by = stats[i, cv2.CC_STAT_TOP] + y1
             bw = stats[i, cv2.CC_STAT_WIDTH]
             bh = stats[i, cv2.CC_STAT_HEIGHT]
+            cx = centroids[i][0]
+            cy = centroids[i][1] + y1
 
             if area < 25:
                 continue
@@ -408,87 +386,23 @@ class LaneFollowNode(Node):
                 continue
 
             aspect = max(bw, bh) / max(min(bw, bh), 1)
+
             if area < 60 and aspect < 1.4:
                 continue
 
-            comp_mask = (labels == i)
-            ys, xs = np.where(comp_mask)
-
-            if len(xs) == 0:
-                continue
-
-            # Control x: use lower part of component, less biased on curves.
-            lower_cut = int(roi_h * 0.55)
-            lower_idx = ys >= lower_cut
-
-            if np.count_nonzero(lower_idx) >= 8:
-                use_xs = xs[lower_idx]
-                use_ys = ys[lower_idx]
-                weights = 1.0 + 2.0 * (use_ys.astype(np.float32) / max(roi_h - 1, 1))
-                cx_control = float(np.average(use_xs.astype(np.float32), weights=weights))
-                cy_control = float(np.average(use_ys.astype(np.float32), weights=weights)) + y1
-            else:
-                use_xs = xs
-                use_ys = ys
-                cx_control = float(centroids[i][0])
-                cy_control = float(centroids[i][1]) + y1
-
-            # Direction: x = slope * y + intercept.
-            slope = 0.0
-            if len(use_xs) >= 8 and np.std(use_ys) > 1.0:
-                try:
-                    slope = float(np.polyfit(use_ys.astype(np.float32), use_xs.astype(np.float32), 1)[0])
-                except Exception:
-                    slope = 0.0
-
-            bottom_local = by_local + bh
-            bottom_touch = bottom_local > int(roi_h * 0.70)
-
             comps.append({
-                'x': float(cx_control),
-                'y': float(cy_control),
+                'x': float(cx),
+                'y': float(cy),
                 'area': float(area),
                 'w': float(bw),
                 'h': float(bh),
-                'slope': float(slope),
-                'bottom_touch': bool(bottom_touch),
                 'bbox': (int(bx), int(by), int(bw), int(bh))
             })
 
         comps = sorted(comps, key=lambda c: c['area'], reverse=True)
         return comps
 
-    # ============================================================
-    # Pair selection
-    # ============================================================
-    def anchor_pair_ok(self, left, right):
-        if not self.had_lane_lock:
-            return True
-
-        if self.last_left_x is None or self.last_right_x is None:
-            return True
-
-        left_err = abs(left['x'] - self.last_left_x)
-        right_err = abs(right['x'] - self.last_right_x)
-
-        if left_err > self.pair_anchor_gate:
-            return False
-
-        if right_err > self.pair_anchor_gate:
-            return False
-
-        # Slope check only if anchors exist.
-        if self.last_left_slope is not None:
-            if abs(left.get('slope', 0.0) - self.last_left_slope) > self.single_slope_gate * 1.6:
-                return False
-
-        if self.last_right_slope is not None:
-            if abs(right.get('slope', 0.0) - self.last_right_slope) > self.single_slope_gate * 1.6:
-                return False
-
-        return True
-
-    def find_best_pair_acquire(self, comps, image_center):
+    def find_best_two_line_pair_acquire(self, comps, image_center):
         if len(comps) < 2:
             return None
 
@@ -499,7 +413,7 @@ class LaneFollowNode(Node):
             target_center = image_center
             target_gate = self.acquire_max_pair_error
 
-        valid = []
+        valid_pairs = []
 
         for i in range(len(comps)):
             for j in range(len(comps)):
@@ -515,9 +429,6 @@ class LaneFollowNode(Node):
                 width = right['x'] - left['x']
 
                 if not (self.min_lane_width_px <= width <= self.max_lane_width_px):
-                    continue
-
-                if not self.anchor_pair_ok(left, right):
                     continue
 
                 center = (left['x'] + right['x']) / 2.0
@@ -532,18 +443,18 @@ class LaneFollowNode(Node):
 
                 area_bonus = min((left['area'] + right['area']) / 400.0, 10.0)
 
-                if self.had_lane_lock:
+                if self.had_lane_lock and self.lane_center_est is not None:
                     score = abs(error_to_target) + 0.35 * abs(error_to_img) - area_bonus
                 else:
                     score = abs(error_to_img) - area_bonus
 
-                valid.append((score, left, right, center, width, error_to_img))
+                valid_pairs.append((score, left, right, center, width, error_to_img))
 
-        if not valid:
+        if not valid_pairs:
             return None
 
-        valid = sorted(valid, key=lambda x: x[0])
-        return valid[0]
+        valid_pairs = sorted(valid_pairs, key=lambda x: x[0])
+        return valid_pairs[0]
 
     def find_best_pair_track(self, comps, pred_center):
         if len(comps) < 2:
@@ -552,7 +463,7 @@ class LaneFollowNode(Node):
         expected_left = pred_center - self.lane_width_px / 2.0
         expected_right = pred_center + self.lane_width_px / 2.0
 
-        valid = []
+        valid_pairs = []
 
         for i in range(len(comps)):
             for j in range(len(comps)):
@@ -570,9 +481,6 @@ class LaneFollowNode(Node):
                 if not (self.min_lane_width_px <= width <= self.max_lane_width_px):
                     continue
 
-                if not self.anchor_pair_ok(left, right):
-                    continue
-
                 center = (left['x'] + right['x']) / 2.0
                 center_dist = abs(center - pred_center)
 
@@ -581,24 +489,19 @@ class LaneFollowNode(Node):
 
                 edge_dist = abs(left['x'] - expected_left) + abs(right['x'] - expected_right)
                 area_bonus = min((left['area'] + right['area']) / 500.0, 8.0)
+
                 score = center_dist + 0.35 * edge_dist - area_bonus
 
-                valid.append((score, left, right, center, width))
+                valid_pairs.append((score, left, right, center, width))
 
-        if not valid:
+        if not valid_pairs:
             return None
 
-        valid = sorted(valid, key=lambda x: x[0])
-        return valid[0]
-
-    def update_lane_anchors_from_pair(self, left, right):
-        self.last_left_x = float(left['x'])
-        self.last_right_x = float(right['x'])
-        self.last_left_slope = float(left.get('slope', 0.0))
-        self.last_right_slope = float(right.get('slope', 0.0))
+        valid_pairs = sorted(valid_pairs, key=lambda x: x[0])
+        return valid_pairs[0]
 
     # ============================================================
-    # Lane estimate
+    # Lane center estimate
     # ============================================================
     def estimate_acquire(self, mask, vis, y1, y2, name, color):
         h, w = mask.shape[:2]
@@ -619,15 +522,13 @@ class LaneFollowNode(Node):
             x, y, bw, bh = c['bbox']
             cv2.rectangle(vis, (x, y), (x + bw, y + bh), (120, 120, 255), 1)
 
-        pair = self.find_best_pair_acquire(comps, image_center)
+        pair = self.find_best_two_line_pair_acquire(comps, image_center)
 
         if pair is None:
             self.draw_text(vis, f'{name}: no valid TWO lines', 30, y1 + 45, (0, 0, 255))
             return None, None, False, len(comps)
 
         _, left, right, center, width, error = pair
-
-        self.update_lane_anchors_from_pair(left, right)
 
         cv2.line(vis, (int(left['x']), y1), (int(left['x']), y2), (0, 255, 255), 3)
         cv2.line(vis, (int(right['x']), y1), (int(right['x']), y2), (0, 255, 255), 3)
@@ -642,42 +543,12 @@ class LaneFollowNode(Node):
 
         return error, center, True, len(comps)
 
-    def single_anchor_ok(self, comp, side):
-        line_x = comp['x']
-        line_slope = comp.get('slope', 0.0)
-
-        if abs(line_slope) > self.max_single_abs_slope:
-            return False, f'slope_abs={line_slope:.2f}'
-
-        if side == 'left':
-            if self.last_left_x is not None:
-                dx = abs(line_x - self.last_left_x)
-                if dx > self.single_anchor_gate:
-                    return False, f'L dx={dx:.0f}'
-
-            if self.last_left_slope is not None:
-                ds = abs(line_slope - self.last_left_slope)
-                if ds > self.single_slope_gate:
-                    return False, f'L ds={ds:.2f}'
-
-        if side == 'right':
-            if self.last_right_x is not None:
-                dx = abs(line_x - self.last_right_x)
-                if dx > self.single_anchor_gate:
-                    return False, f'R dx={dx:.0f}'
-
-            if self.last_right_slope is not None:
-                ds = abs(line_slope - self.last_right_slope)
-                if ds > self.single_slope_gate:
-                    return False, f'R ds={ds:.2f}'
-
-        return True, 'ok'
-
     def estimate_track(self, mask, vis, y1, y2, name, color, allow_single=True):
         h, w = mask.shape[:2]
         image_center = w / 2.0
 
         pred_center = self.lane_center_est if self.lane_center_est is not None else image_center
+
         expected_left = pred_center - self.lane_width_px / 2.0
         expected_right = pred_center + self.lane_width_px / 2.0
 
@@ -688,20 +559,18 @@ class LaneFollowNode(Node):
         cv2.line(vis, (int(pred_center), y1), (int(pred_center), y2), (255, 180, 0), 2)
         cv2.line(vis, (int(expected_left), y1), (int(expected_left), y2), (180, 0, 255), 1)
         cv2.line(vis, (int(expected_right), y1), (int(expected_right), y2), (180, 0, 255), 1)
-
         self.draw_text(vis, f'{name} TRACK', 10, y1 + 20, color, 0.55, 2)
 
         for c in comps[:8]:
             x, y, bw, bh = c['bbox']
             cv2.rectangle(vis, (x, y), (x + bw, y + bh), (120, 120, 255), 1)
 
-        # 1) Pair first
+        # First priority: use two-line pair.
         pair = self.find_best_pair_track(comps, pred_center)
 
         if pair is not None:
             _, left, right, center, width = pair
 
-            self.update_lane_anchors_from_pair(left, right)
             self.lane_width_px = 0.95 * self.lane_width_px + 0.05 * width
 
             error = center - image_center
@@ -714,12 +583,12 @@ class LaneFollowNode(Node):
             self.draw_text(vis, 'RIGHT LINE', right['x'] + 5, y1 + 70, (0, 255, 255), 0.55, 2)
             self.draw_text(vis, 'LANE CENTER', center + 5, y1 + 95, (0, 0, 255), 0.55, 2)
 
-            self.draw_text(vis, f'{name}: PAIR width={width:.0f}', 30, y2 - 30, (0, 255, 255))
+            self.draw_text(vis, f'{name}: L+R width={width:.0f}', 30, y2 - 30, (0, 255, 255))
             self.draw_text(vis, f'{name}: err={error:.0f}', 30, y2 - 10, (0, 0, 255))
 
             return error, center, 'pair'
 
-        # 2) Safe single fallback
+        # Safe single-line fallback.
         if not allow_single:
             self.draw_text(vis, f'{name}: single disabled', 30, y1 + 45, (0, 0, 255))
             return None, None, 'none'
@@ -736,6 +605,7 @@ class LaneFollowNode(Node):
 
         for c in comps:
             x = c['x']
+
             dl = abs(x - expected_left)
             dr = abs(x - expected_right)
 
@@ -753,32 +623,26 @@ class LaneFollowNode(Node):
                 best_dl = dl
                 best_dr = dr
 
-        if best is None:
-            return None, None, 'none'
-
-        if best_dist > self.single_line_gate:
+        if best is None or best_dist > self.single_line_gate:
             self.draw_text(vis, f'{name}: reject single dist', 30, y1 + 45, (0, 0, 255))
             return None, None, 'none'
 
+        # If left/right classification is ambiguous, reject.
         if abs(best_dl - best_dr) < self.single_ambiguous_margin:
             self.draw_text(vis, f'{name}: reject ambiguous single', 30, y1 + 45, (0, 0, 255))
             return None, None, 'none'
 
-        ok, reason = self.single_anchor_ok(best, best_side)
-        if not ok:
-            self.draw_text(vis, f'{name}: reject single anchor {reason}', 30, y1 + 70, (0, 0, 255))
-            return None, None, 'none'
-
         line_x = best['x']
-        line_slope = best.get('slope', 0.0)
 
-        # Side sanity check
-        if best_side == 'left' and line_x > pred_center + 10:
-            self.draw_text(vis, f'{name}: reject L side', 30, y1 + 95, (0, 0, 255))
+        # Hard side check.
+        # If it is left line, it should be clearly left of predicted center.
+        # If it is right line, it should be clearly right of predicted center.
+        if best_side == 'left' and line_x > pred_center - 5:
+            self.draw_text(vis, f'{name}: reject left/right risk', 30, y1 + 70, (0, 0, 255))
             return None, None, 'none'
 
-        if best_side == 'right' and line_x < pred_center - 10:
-            self.draw_text(vis, f'{name}: reject R side', 30, y1 + 95, (0, 0, 255))
+        if best_side == 'right' and line_x < pred_center + 5:
+            self.draw_text(vis, f'{name}: reject right/left risk', 30, y1 + 70, (0, 0, 255))
             return None, None, 'none'
 
         if best_side == 'left':
@@ -790,8 +654,9 @@ class LaneFollowNode(Node):
             virtual_x = center - self.lane_width_px / 2.0
             cv2.line(vis, (int(virtual_x), y1), (int(virtual_x), y2), (0, 180, 255), 1)
 
+        # Do not allow single-line fallback to move center too far.
         if abs(center - pred_center) > self.max_center_jump:
-            self.draw_text(vis, f'{name}: reject single jump', 30, y1 + 120, (0, 0, 255))
+            self.draw_text(vis, f'{name}: reject single jump', 30, y1 + 45, (0, 0, 255))
             return None, None, 'none'
 
         error = center - image_center
@@ -799,72 +664,10 @@ class LaneFollowNode(Node):
         cv2.line(vis, (int(line_x), y1), (int(line_x), y2), (0, 255, 255), 3)
         cv2.line(vis, (int(center), y1), (int(center), y2), (0, 0, 255), 3)
 
-        self.draw_text(vis, f'{name}: SINGLE {best_side.upper()} slope={line_slope:.2f}', 30, y2 - 30, (0, 255, 255))
+        self.draw_text(vis, f'{name}: SINGLE {best_side.upper()} LINE', 30, y2 - 30, (0, 255, 255))
         self.draw_text(vis, f'{name}: err={error:.0f}', 30, y2 - 10, (0, 0, 255))
 
         return error, center, 'single'
-
-    # ============================================================
-    # Curve debug
-    # ============================================================
-    def estimate_circle_from_3pts(self, p1, p2, p3):
-        x1, y1 = p1
-        x2, y2 = p2
-        x3, y3 = p3
-
-        temp = x2 * x2 + y2 * y2
-        bc = (x1 * x1 + y1 * y1 - temp) / 2.0
-        cd = (temp - x3 * x3 - y3 * y3) / 2.0
-
-        det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
-
-        if abs(det) < 1e-5:
-            return None
-
-        cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
-        cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
-        r = math.sqrt((cx - x1) ** 2 + (cy - y1) ** 2)
-
-        return cx, cy, r
-
-    def curve_debug(self, vis, h, w, near_center, mid_center):
-        if near_center is None or mid_center is None:
-            return
-
-        image_center = w / 2.0
-
-        p_bottom = (image_center, h * 0.96)
-        p_near = (float(near_center), h * 0.83)
-        p_mid = (float(mid_center), h * 0.64)
-
-        circle = self.estimate_circle_from_3pts(p_bottom, p_near, p_mid)
-        shift = float(mid_center - near_center)
-
-        if shift > 12:
-            side = "RIGHT"
-        elif shift < -12:
-            side = "LEFT"
-        else:
-            side = "STRAIGHT"
-
-        cv2.circle(vis, (int(p_bottom[0]), int(p_bottom[1])), 5, (255, 0, 0), -1)
-        cv2.circle(vis, (int(p_near[0]), int(p_near[1])), 5, (0, 255, 255), -1)
-        cv2.circle(vis, (int(p_mid[0]), int(p_mid[1])), 5, (0, 180, 255), -1)
-
-        if circle is None:
-            txt = f'CURVE side:{side} shift:{shift:.1f} r:None'
-        else:
-            cx, cy, r = circle
-            if -2 * w < cx < 3 * w and -2 * h < cy < 3 * h:
-                cv2.circle(vis, (int(cx), int(cy)), 7, (0, 0, 255), -1)
-            txt = f'CURVE side:{side} shift:{shift:.1f} center:({cx:.1f},{cy:.1f}) r:{r:.1f}'
-
-        self.draw_text(vis, txt, 25, 128, (255, 255, 0), 0.48, 2)
-
-        now = time.time()
-        if now - self.last_curve_print_time > self.curve_print_interval:
-            print(txt)
-            self.last_curve_print_time = now
 
     # ============================================================
     # Control
@@ -923,16 +726,16 @@ class LaneFollowNode(Node):
 
         if self.lost_count <= 3:
             strength = 0.12
-            speed = self.lost_speed_1
+            speed = 0.20
         elif self.lost_count <= 10:
             strength = 0.20
-            speed = self.lost_speed_2
+            speed = 0.16
         elif self.lost_count <= 18:
             strength = 0.26
-            speed = self.lost_speed_3
+            speed = 0.10
         else:
             strength = 0.18
-            speed = self.lost_speed_4
+            speed = 0.05
 
         target_steer = target_dir * strength
 
@@ -946,9 +749,20 @@ class LaneFollowNode(Node):
         return speed, steer
 
     # ============================================================
-    # Line contact guard
+    # Line-contact safety guard
     # ============================================================
     def line_contact_guard(self, mask, vis):
+        """
+        Detect whether the vehicle is too close to a lane line.
+
+        We look at the lower part of the image, near the vehicle footprint.
+        If the closest yellow mask pixel is too close to image center,
+        force the car to steer away from that line.
+
+        Steering sign follows current controller:
+        - line on left  -> steer negative, move right
+        - line on right -> steer positive, move left
+        """
         h, w = mask.shape[:2]
         image_center = w / 2.0
 
@@ -961,9 +775,10 @@ class LaneFollowNode(Node):
         roi = mask[y1:y2, x1:x2]
         ys, xs = np.where(roi > 0)
 
-        contact_px = max(50.0, min(78.0, self.contact_ratio * self.lane_width_px))
-        warning_px = max(80.0, min(120.0, self.warning_ratio * self.lane_width_px))
+        contact_px = max(55.0, min(85.0, self.contact_ratio * self.lane_width_px))
+        warning_px = max(85.0, min(125.0, self.warning_ratio * self.lane_width_px))
 
+        # Draw danger zones
         cv2.rectangle(
             vis,
             (int(image_center - contact_px), y1),
@@ -971,7 +786,6 @@ class LaneFollowNode(Node):
             (0, 0, 255),
             2
         )
-
         cv2.rectangle(
             vis,
             (int(image_center - warning_px), y1),
@@ -982,12 +796,12 @@ class LaneFollowNode(Node):
 
         if len(xs) == 0:
             return {
-                'active': False,
-                'contact': False,
-                'target_steer': 0.0,
-                'speed_limit': 999.0,
-                'dist': 999.0,
-                'side': 'none'
+                "active": False,
+                "contact": False,
+                "target_steer": 0.0,
+                "speed_limit": 999.0,
+                "dist": 999.0,
+                "side": "none"
             }
 
         xs = xs.astype(np.float32) + x1
@@ -999,18 +813,20 @@ class LaneFollowNode(Node):
 
         if min_dist > warning_px:
             return {
-                'active': False,
-                'contact': False,
-                'target_steer': 0.0,
-                'speed_limit': 999.0,
-                'dist': min_dist,
-                'side': 'clear'
+                "active": False,
+                "contact": False,
+                "target_steer": 0.0,
+                "speed_limit": 999.0,
+                "dist": min_dist,
+                "side": "clear"
             }
 
         line_on_left = closest_x < image_center
-        side = 'left' if line_on_left else 'right'
+        side = "left" if line_on_left else "right"
 
-        # If this correction direction is wrong, flip this line.
+        # Current sign convention:
+        # line on left  -> steer negative to move right
+        # line on right -> steer positive to move left
         steer_sign = -1.0 if line_on_left else 1.0
 
         contact = min_dist < contact_px
@@ -1019,12 +835,12 @@ class LaneFollowNode(Node):
             target_steer = steer_sign * self.contact_steer
             speed_limit = self.contact_speed_limit
             color = (0, 0, 255)
-            label = 'LINE CONTACT'
+            label = "LINE CONTACT"
         else:
             target_steer = steer_sign * self.warning_steer
             speed_limit = self.warning_speed_limit
             color = (0, 180, 255)
-            label = 'LINE WARNING'
+            label = "LINE WARNING"
 
         cv2.circle(vis, (int(closest_x), int((y1 + y2) / 2)), 7, color, -1)
         cv2.line(vis, (int(closest_x), y1), (int(closest_x), y2), color, 2)
@@ -1040,29 +856,171 @@ class LaneFollowNode(Node):
         )
 
         return {
-            'active': True,
-            'contact': contact,
-            'target_steer': target_steer,
-            'speed_limit': speed_limit,
-            'dist': min_dist,
-            'side': side
+            "active": True,
+            "contact": contact,
+            "target_steer": target_steer,
+            "speed_limit": speed_limit,
+            "dist": min_dist,
+            "side": side
         }
 
     def apply_line_guard(self, speed, steer, guard):
-        if guard is None or not guard['active']:
+        """
+        Safety layer over PID output.
+        If the vehicle is pressing a lane line, override steering partially.
+        """
+        if guard is None or not guard["active"]:
             return speed, steer
 
-        target = guard['target_steer']
+        target = guard["target_steer"]
 
-        if guard['contact']:
-            steer = 0.40 * steer + 0.60 * target
-            speed = float(min(speed, guard['speed_limit']))
+        if guard["contact"]:
+            steer = 0.25 * steer + 0.75 * target
         else:
-            steer = 0.75 * steer + 0.25 * target
-            speed = float(min(speed, guard['speed_limit']))
+            steer = 0.60 * steer + 0.40 * target
 
         steer = float(np.clip(steer, -self.max_steer, self.max_steer))
+        speed = float(min(speed, guard["speed_limit"]))
+
         return speed, steer
+
+
+    # ============================================================
+    # Line-contact safety guard
+    # ============================================================
+    def line_contact_guard(self, mask, vis):
+        """
+        Detect whether the vehicle is too close to a lane line.
+
+        We look at the lower part of the image, near the vehicle footprint.
+        If the closest yellow mask pixel is too close to image center,
+        force the car to steer away from that line.
+
+        Steering sign follows current controller:
+        - line on left  -> steer negative, move right
+        - line on right -> steer positive, move left
+        """
+        h, w = mask.shape[:2]
+        image_center = w / 2.0
+
+        y1 = int(h * 0.76)
+        y2 = int(h * 0.98)
+
+        x1 = int(w * 0.12)
+        x2 = int(w * 0.88)
+
+        roi = mask[y1:y2, x1:x2]
+        ys, xs = np.where(roi > 0)
+
+        contact_px = max(55.0, min(85.0, self.contact_ratio * self.lane_width_px))
+        warning_px = max(85.0, min(125.0, self.warning_ratio * self.lane_width_px))
+
+        # Draw danger zones
+        cv2.rectangle(
+            vis,
+            (int(image_center - contact_px), y1),
+            (int(image_center + contact_px), y2),
+            (0, 0, 255),
+            2
+        )
+        cv2.rectangle(
+            vis,
+            (int(image_center - warning_px), y1),
+            (int(image_center + warning_px), y2),
+            (0, 180, 255),
+            1
+        )
+
+        if len(xs) == 0:
+            return {
+                "active": False,
+                "contact": False,
+                "target_steer": 0.0,
+                "speed_limit": 999.0,
+                "dist": 999.0,
+                "side": "none"
+            }
+
+        xs = xs.astype(np.float32) + x1
+        dists = np.abs(xs - image_center)
+
+        idx = int(np.argmin(dists))
+        closest_x = float(xs[idx])
+        min_dist = float(dists[idx])
+
+        if min_dist > warning_px:
+            return {
+                "active": False,
+                "contact": False,
+                "target_steer": 0.0,
+                "speed_limit": 999.0,
+                "dist": min_dist,
+                "side": "clear"
+            }
+
+        line_on_left = closest_x < image_center
+        side = "left" if line_on_left else "right"
+
+        # Current sign convention:
+        # line on left  -> steer negative to move right
+        # line on right -> steer positive to move left
+        steer_sign = -1.0 if line_on_left else 1.0
+
+        contact = min_dist < contact_px
+
+        if contact:
+            target_steer = steer_sign * self.contact_steer
+            speed_limit = self.contact_speed_limit
+            color = (0, 0, 255)
+            label = "LINE CONTACT"
+        else:
+            target_steer = steer_sign * self.warning_steer
+            speed_limit = self.warning_speed_limit
+            color = (0, 180, 255)
+            label = "LINE WARNING"
+
+        cv2.circle(vis, (int(closest_x), int((y1 + y2) / 2)), 7, color, -1)
+        cv2.line(vis, (int(closest_x), y1), (int(closest_x), y2), color, 2)
+
+        self.draw_text(
+            vis,
+            f'{label}: {side} dist:{min_dist:.0f} target:{target_steer:.2f}',
+            25,
+            98,
+            color,
+            0.58,
+            2
+        )
+
+        return {
+            "active": True,
+            "contact": contact,
+            "target_steer": target_steer,
+            "speed_limit": speed_limit,
+            "dist": min_dist,
+            "side": side
+        }
+
+    def apply_line_guard(self, speed, steer, guard):
+        """
+        Safety layer over PID output.
+        If the vehicle is pressing a lane line, override steering partially.
+        """
+        if guard is None or not guard["active"]:
+            return speed, steer
+
+        target = guard["target_steer"]
+
+        if guard["contact"]:
+            steer = 0.25 * steer + 0.75 * target
+        else:
+            steer = 0.60 * steer + 0.40 * target
+
+        steer = float(np.clip(steer, -self.max_steer, self.max_steer))
+        speed = float(min(speed, guard["speed_limit"]))
+
+        return speed, steer
+
 
     # ============================================================
     # Visualization
@@ -1070,7 +1028,33 @@ class LaneFollowNode(Node):
     def overlay_mask(self, vis, mask, color):
         overlay = vis.copy()
         overlay[mask > 0] = color
-        return cv2.addWeighted(vis, 0.80, overlay, 0.20, 0.0)
+        return cv2.addWeighted(vis, 0.78, overlay, 0.22, 0.0)
+
+    def draw_mask_panels(self, vis, yellow_mask, yolo_mask, final_mask):
+        h, w = vis.shape[:2]
+
+        small_w = int(w * 0.27)
+        small_h = int(h * 0.20)
+
+        yellow_vis = cv2.cvtColor(yellow_mask, cv2.COLOR_GRAY2BGR)
+        yolo_vis = cv2.cvtColor(yolo_mask, cv2.COLOR_GRAY2BGR)
+        final_vis = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR)
+
+        yellow_vis = cv2.resize(yellow_vis, (small_w, small_h))
+        yolo_vis = cv2.resize(yolo_vis, (small_w, small_h))
+        final_vis = cv2.resize(final_vis, (small_w, small_h))
+
+        panels = np.hstack([yellow_vis, yolo_vis, final_vis])
+
+        x0 = 5
+        y0 = h - small_h - 5
+        x1 = min(x0 + panels.shape[1], w)
+
+        vis[y0:y0 + small_h, x0:x1] = panels[:, :x1 - x0]
+
+        self.draw_text(vis, 'yellow', x0 + 8, y0 + 20, (0, 255, 255), 0.45, 1)
+        self.draw_text(vis, 'yolo', x0 + small_w + 8, y0 + 20, (255, 180, 0), 0.45, 1)
+        self.draw_text(vis, 'final', x0 + 2 * small_w + 8, y0 + 20, (0, 255, 0), 0.45, 1)
 
     # ============================================================
     # Main callback
@@ -1088,6 +1072,10 @@ class LaneFollowNode(Node):
         vis = frame.copy()
         vis = self.overlay_mask(vis, final_mask, (0, 255, 0))
 
+        # High-priority safety check: are we pressing a lane line?
+        guard = self.line_contact_guard(final_mask, vis)
+
+        # High-priority safety check: are we pressing a lane line?
         guard = self.line_contact_guard(final_mask, vis)
 
         acquire_y1 = int(h * 0.52)
@@ -1099,9 +1087,6 @@ class LaneFollowNode(Node):
         mid_y1 = int(h * 0.56)
         mid_y2 = int(h * 0.72)
 
-        # =========================
-        # ACQUIRE
-        # =========================
         if self.state == 'ACQUIRE':
             error, center, two_lines, comp_count = self.estimate_acquire(
                 final_mask,
@@ -1115,14 +1100,14 @@ class LaneFollowNode(Node):
             if not two_lines or error is None:
                 speed, steer = self.directed_lost_search_control()
                 speed, steer = self.apply_line_guard(speed, steer, guard)
+                speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
                 self.acquire_count = 0
 
-                if self.had_lane_lock:
+                reason = 'need TWO valid lines'
+                if self.had_lane_lock and self.lane_center_est is not None:
                     reason = 'need TWO lines near locked lane'
-                else:
-                    reason = 'need TWO valid lines'
 
                 self.draw_text(
                     vis,
@@ -1137,6 +1122,7 @@ class LaneFollowNode(Node):
             else:
                 speed, steer, d_error = self.compute_pid_control(error)
                 speed = min(speed, self.acquire_speed_limit)
+                speed, steer = self.apply_line_guard(speed, steer, guard)
                 speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
@@ -1164,10 +1150,12 @@ class LaneFollowNode(Node):
                     2
                 )
 
-        # =========================
-        # TRACK
-        # =========================
         elif self.state == 'TRACK':
+            # Safe single fallback is allowed only when tracking is stable.
+            # Allow single-line fallback when we have a locked lane history.
+            # Do NOT reject it only because the curve has large steering/error.
+            # The real trust check is inside estimate_track(): distance to expected left/right,
+            # ambiguity margin, side check, and center jump check.
             allow_single = (
                 self.had_lane_lock and
                 self.lane_center_est is not None and
@@ -1197,6 +1185,9 @@ class LaneFollowNode(Node):
             if near_error is None and mid_error is None:
                 self.track_lost_count += 1
 
+                # Do NOT clear lane_center_est here.
+                # Keeping it prevents jumping to adjacent lane in hairpins.
+
                 if self.track_lost_count > self.max_track_lost_count:
                     self.state = 'ACQUIRE'
                     self.acquire_count = 0
@@ -1205,11 +1196,12 @@ class LaneFollowNode(Node):
 
                 speed, steer = self.directed_lost_search_control()
                 speed, steer = self.apply_line_guard(speed, steer, guard)
+                speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
                 self.draw_text(
                     vis,
-                    f'TRACK LOST -> search locked lane {self.track_lost_count}/{self.max_track_lost_count} steer:{steer:.3f} speed:{speed:.2f}',
+                    f'TRACK LOST -> search near locked lane {self.track_lost_count}/{self.max_track_lost_count} steer:{steer:.3f} speed:{speed:.2f}',
                     25,
                     38,
                     (0, 0, 255),
@@ -1221,20 +1213,19 @@ class LaneFollowNode(Node):
                 self.track_lost_count = 0
                 self.lost_count = 0
 
-                # Combine near/mid. Pair is trusted more than single.
                 if near_error is not None and mid_error is not None:
+                    # Single-line result is weaker than two-line pair.
                     near_w = 0.82
                     mid_w = 0.18
 
                     if near_mode == 'single':
-                        near_w *= 0.45
-
+                        near_w *= 0.65
                     if mid_mode == 'single':
-                        mid_w *= 0.45
+                        mid_w *= 0.65
 
-                    total = near_w + mid_w
-                    near_w /= total
-                    mid_w /= total
+                    s = near_w + mid_w
+                    near_w /= s
+                    mid_w /= s
 
                     error = near_w * near_error + mid_w * mid_error
                     center_now = near_w * near_center + mid_w * mid_center
@@ -1242,75 +1233,24 @@ class LaneFollowNode(Node):
                 elif near_error is not None:
                     error = near_error
                     center_now = near_center
-
                     if near_mode == 'single':
-                        error *= 0.55
+                        error *= 0.65
 
                 else:
-                    # Mid-only single is risky in adjacent hairpins.
-                    if mid_mode == 'single':
-                        self.track_lost_count += 1
-                        speed, steer = self.directed_lost_search_control()
-                        speed, steer = self.apply_line_guard(speed, steer, guard)
-                        self.publish_cmd(speed, steer)
-
-                        self.draw_text(
-                            vis,
-                            f'TRACK HOLD: mid-only single rejected steer:{steer:.3f} speed:{speed:.2f}',
-                            25,
-                            38,
-                            (0, 0, 255),
-                            0.62,
-                            2
-                        )
-
-                        out_msg = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
-                        self.vis_pub.publish(out_msg)
-                        return
-
                     error = 0.55 * mid_error
                     center_now = mid_center
+                    if mid_mode == 'single':
+                        error *= 0.65
 
-                # Debug curve only. No curve bias.
-                if near_center is not None and mid_center is not None:
-                    self.curve_debug(vis, h, w, near_center, mid_center)
-
-                # Locked center update only from pair.
-                pair_centers = []
-
-                if near_error is not None and near_mode == 'pair':
-                    pair_centers.append((0.82, near_center))
-
-                if mid_error is not None and mid_mode == 'pair':
-                    pair_centers.append((0.18, mid_center))
-
-                if len(pair_centers) > 0:
-                    total_w = sum([p[0] for p in pair_centers])
-                    pair_center_now = sum([p[0] * p[1] for p in pair_centers]) / total_w
-
+                if center_now is not None:
                     if self.lane_center_est is None:
-                        self.lane_center_est = pair_center_now
+                        self.lane_center_est = center_now
                     else:
-                        delta = pair_center_now - self.lane_center_est
-                        delta = float(np.clip(delta, -self.lock_update_max_step, self.lock_update_max_step))
-                        self.lane_center_est = self.lane_center_est + 0.10 * delta
+                        # Update locked center slowly, avoid drifting into adjacent lane.
+                        self.lane_center_est = 0.90 * self.lane_center_est + 0.10 * center_now
 
                 speed, steer, d_error = self.compute_pid_control(error)
-
-                single_used = (near_mode == 'single') or (mid_mode == 'single')
-                pair_used = (near_mode == 'pair') or (mid_mode == 'pair')
-
-                if single_used and not pair_used and allow_single:
-                    speed = max(speed, self.safe_single_speed_floor)
-
-                # Curve speed limit by center shift only, not bias.
-                if near_center is not None and mid_center is not None:
-                    curve_strength = abs(float(mid_center - near_center))
-                    if curve_strength > 125:
-                        speed = min(speed, 1.05)
-                    elif curve_strength > 75:
-                        speed = min(speed, 1.45)
-
+                speed, steer = self.apply_line_guard(speed, steer, guard)
                 speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
@@ -1342,13 +1282,7 @@ class LaneFollowNode(Node):
             label = 'locked center' if self.had_lane_lock else 'center est'
             self.draw_text(vis, label, int(self.lane_center_est) + 5, 95, (255, 180, 0), 0.5, 1)
 
-        if self.last_left_x is not None:
-            cv2.line(vis, (int(self.last_left_x), 0), (int(self.last_left_x), h), (0, 200, 255), 1)
-            self.draw_text(vis, 'left anchor', int(self.last_left_x) + 5, 180, (0, 200, 255), 0.45, 1)
-
-        if self.last_right_x is not None:
-            cv2.line(vis, (int(self.last_right_x), 0), (int(self.last_right_x), h), (0, 200, 255), 1)
-            self.draw_text(vis, 'right anchor', int(self.last_right_x) + 5, 205, (0, 200, 255), 0.45, 1)
+        # mask panels hidden for clean visualization
 
         out_msg = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
         self.vis_pub.publish(out_msg)
