@@ -17,7 +17,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'models'),
-            ['../../../models/lane_yolo/best.pt']),
+            ['../../models/lane_yolo/best.pt']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
