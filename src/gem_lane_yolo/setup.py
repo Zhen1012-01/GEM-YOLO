@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import setup
 
 package_name = 'gem_lane_yolo'
@@ -5,17 +8,21 @@ package_name = 'gem_lane_yolo'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'models'),
+            ['../../../models/lane_yolo/best.pt']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='ubuntu',
-    maintainer_email='ubuntu@todo.todo',
+    maintainer='Zhen Song',
+    maintainer_email='zhen1012-01@users.noreply.github.com',
     description='YOLO lane detection node for GEM simulator',
     license='MIT',
     tests_require=['pytest'],

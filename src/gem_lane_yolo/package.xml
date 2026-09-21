@@ -2,14 +2,19 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>gem_lane_yolo</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
-  <license>TODO: License declaration</license>
+  <version>0.1.0</version>
+  <description>YOLO and OpenCV lane-following controller for the GEM ROS2 simulator.</description>
+  <maintainer email="zhen1012-01@users.noreply.github.com">Zhen Song</maintainer>
+  <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>ackermann_msgs</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -1,0 +1,29 @@
+lane_follow_node:
+  ros__parameters:
+    model_path: ""
+    image_topic: /camera/image_raw
+    control_topic: /ackermann_cmd
+    visualization_topic: /lane_follow/vis
+    use_yolo: true
+    yolo_confidence: 0.35
+    yolo_image_size: 640
+    yolo_every_n_frames: 2
+    yellow_hsv_lower: [14, 35, 65]
+    yellow_hsv_upper: [48, 255, 255]
+    lab_b_threshold: 145
+    roi_top_ratio: 0.40
+    pid.kp: 0.0058
+    pid.ki: 0.0
+    pid.kd: 0.0022
+    max_steering: 0.62
+    max_steering_delta: 0.060
+    target_speed: 2.05
+    base_speed: 1.50
+    minimum_speed: 0.45
+    lost_speed: 0.18
+    lane_width_px: 230.0
+    minimum_lane_width_px: 120.0
+    maximum_lane_width_px: 560.0
+    single_line_gate_px: 280.0
+    maximum_center_jump_px: 260.0
+    save_directory: ~/lane_dataset/images
