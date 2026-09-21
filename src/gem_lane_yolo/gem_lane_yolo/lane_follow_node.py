@@ -33,13 +33,38 @@ class LaneFollowNode(Node):
         # =========================
         # YOLO model
         # =========================
-        self.model_path = os.path.expanduser('~/lane_models/best.pt')
-        self.yolo_model = None
-        self.use_yolo = True
-        self.yolo_conf = 0.35
-        self.yolo_imgsz = 640
+        defaults = {
+            'model_path': '', 'image_topic': '/camera/image_raw',
+            'control_topic': '/ackermann_cmd', 'visualization_topic': '/lane_follow/vis',
+            'use_yolo': True, 'yolo_confidence': 0.35, 'yolo_image_size': 640,
+            'yolo_every_n_frames': 2, 'pid.kp': 0.0058, 'pid.ki': 0.0,
+            'pid.kd': 0.0022, 'max_steering': 0.62,
+            'max_steering_delta': 0.060, 'target_speed': 2.05,
+            'base_speed': 1.50, 'minimum_speed': 0.45,
+            'lost_speed': 0.18, 'roi_top_ratio': 0.40,
+            'yellow_hsv_lower': [14, 35, 65], 'yellow_hsv_upper': [48, 255, 255],
+            'lab_b_threshold': 145, 'lane_width_px': 230.0,
+            'minimum_lane_width_px': 120.0, 'maximum_lane_width_px': 560.0,
+            'single_line_gate_px': 280.0, 'maximum_center_jump_px': 260.0,
+            'save_directory': '~/lane_dataset/images',
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
 
-        self.yolo_every_n = 2
+        configured_model = self.get_parameter('model_path').value
+        if configured_model:
+            self.model_path = os.path.expanduser(configured_model)
+        else:
+            from ament_index_python.packages import get_package_share_directory
+            self.model_path = os.path.join(
+                get_package_share_directory('gem_lane_yolo'), 'models', 'best.pt'
+            )
+        self.yolo_model = None
+        self.use_yolo = bool(self.get_parameter('use_yolo').value)
+        self.yolo_conf = float(self.get_parameter('yolo_confidence').value)
+        self.yolo_imgsz = int(self.get_parameter('yolo_image_size').value)
+
+        self.yolo_every_n = max(1, int(self.get_parameter('yolo_every_n_frames').value))
         self.frame_id = 0
         self.cached_yolo_mask = None
         self.cached_yolo_count = 0
@@ -74,43 +99,43 @@ class LaneFollowNode(Node):
         # error = lane_center_x - image_center_x
         # steer = -(kp * error + kd * d_error)
         # =========================
-        self.kp = 0.0058
-        self.ki = 0.0
-        self.kd = 0.0022
+        self.kp = float(self.get_parameter('pid.kp').value)
+        self.ki = float(self.get_parameter('pid.ki').value)
+        self.kd = float(self.get_parameter('pid.kd').value)
 
         self.error_sum = 0.0
         self.last_error = 0.0
         self.last_d_error = 0.0
         self.last_steer = 0.0
 
-        self.max_steer = 0.62
-        self.max_steer_delta = 0.060
+        self.max_steer = float(self.get_parameter('max_steering').value)
+        self.max_steer_delta = float(self.get_parameter('max_steering_delta').value)
 
         # =========================
         # Speed
         # =========================
-        self.fast_speed = 2.05
-        self.base_speed = 1.50
-        self.min_speed = 0.45
+        self.fast_speed = float(self.get_parameter('target_speed').value)
+        self.base_speed = float(self.get_parameter('base_speed').value)
+        self.min_speed = float(self.get_parameter('minimum_speed').value)
         self.acquire_speed_limit = 0.65
-        self.lost_speed = 0.18
+        self.lost_speed = float(self.get_parameter('lost_speed').value)
 
         # =========================
         # Lane geometry
         # =========================
-        self.lane_width_px = 230.0
-        self.min_lane_width_px = 120.0
-        self.max_lane_width_px = 560.0
+        self.lane_width_px = float(self.get_parameter('lane_width_px').value)
+        self.min_lane_width_px = float(self.get_parameter('minimum_lane_width_px').value)
+        self.max_lane_width_px = float(self.get_parameter('maximum_lane_width_px').value)
 
         self.lane_center_est = None
         self.had_lane_lock = False
 
-        self.single_line_gate = 280.0
+        self.single_line_gate = float(self.get_parameter('single_line_gate_px').value)
         self.single_ambiguous_margin = 10.0
         self.single_error_gate = 360.0
         self.single_steer_gate = 0.70
         self.safe_single_speed_floor = 2.10
-        self.max_center_jump = 260.0
+        self.max_center_jump = float(self.get_parameter('maximum_center_jump_px').value)
 
         # Line-contact guard:
         # If a yellow lane line appears too close to the image center at the bottom,
@@ -140,38 +165,31 @@ class LaneFollowNode(Node):
         # Save image
         self.latest_frame = None
         self.image_count = 0
-        self.save_dir = os.path.expanduser('~/lane_dataset/images')
+        self.save_dir = os.path.expanduser(self.get_parameter('save_directory').value)
         os.makedirs(self.save_dir, exist_ok=True)
 
         # ROS topics
-        self.cmd_pub = self.create_publisher(AckermannDrive, '/ackermann_cmd', 10)
-        self.vis_pub = self.create_publisher(Image, '/lane_follow/vis', 10)
-        self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        control_topic = self.get_parameter('control_topic').value
+        visualization_topic = self.get_parameter('visualization_topic').value
+        image_topic = self.get_parameter('image_topic').value
+        self.cmd_pub = self.create_publisher(AckermannDrive, control_topic, 10)
+        self.vis_pub = self.create_publisher(Image, visualization_topic, 10)
+        self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
 
         self.timer = self.create_timer(0.02, self.keyboard_loop)
 
-        print('')
-        print('========== YOLO + OpenCV + PID Lane Follow ==========')
-        print(f'Model path : {self.model_path}')
-        print(f'YOLO mode  : {self.use_yolo}')
-        print('State      : ACQUIRE -> TRACK -> ACQUIRE')
-        print('ACQUIRE    : must see TWO lines and center car')
-        print('TRACK      : two lines preferred, safe single-line fallback allowed')
-        print('Anti-change: keep locked center when reacquiring')
-        print('SPACE      : save current camera image')
-        print('q          : quit')
-        print('Vis topic  : /lane_follow/vis')
-        print('Cmd topic  : /ackermann_cmd')
-        print('=====================================================')
-        print('')
+        self.get_logger().info(
+            f'Lane follower ready: image={image_topic}, command={control_topic}, '
+            f'visualization={visualization_topic}, yolo={self.use_yolo}'
+        )
 
     # ============================================================
     # ROS / keyboard
     # ============================================================
     def publish_cmd(self, speed, steer):
         msg = AckermannDrive()
-        msg.speed = float(speed)
-        msg.steering_angle = float(steer)
+        msg.speed = float(np.clip(speed, 0.0, self.fast_speed))
+        msg.steering_angle = float(np.clip(steer, -self.max_steer, self.max_steer))
         self.cmd_pub.publish(msg)
 
     def get_key(self):
@@ -232,8 +250,8 @@ class LaneFollowNode(Node):
         mask = np.zeros((h, w), dtype=np.uint8)
 
         poly = np.array([[
-            (0, int(h * 0.40)),
-            (w, int(h * 0.40)),
+            (0, int(h * float(self.get_parameter('roi_top_ratio').value))),
+            (w, int(h * float(self.get_parameter('roi_top_ratio').value))),
             (w, h),
             (0, h)
         ]], dtype=np.int32)
@@ -247,12 +265,14 @@ class LaneFollowNode(Node):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
 
-        lower_yellow = np.array([14, 35, 65])
-        upper_yellow = np.array([48, 255, 255])
+        lower_yellow = np.array(self.get_parameter('yellow_hsv_lower').value)
+        upper_yellow = np.array(self.get_parameter('yellow_hsv_upper').value)
         mask_hsv = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
         _, _, b = cv2.split(lab)
-        _, mask_lab = cv2.threshold(b, 145, 255, cv2.THRESH_BINARY)
+        _, mask_lab = cv2.threshold(
+            b, int(self.get_parameter('lab_b_threshold').value), 255, cv2.THRESH_BINARY
+        )
 
         mask = cv2.bitwise_or(mask_hsv, mask_lab)
 
@@ -1100,7 +1120,6 @@ class LaneFollowNode(Node):
             if not two_lines or error is None:
                 speed, steer = self.directed_lost_search_control()
                 speed, steer = self.apply_line_guard(speed, steer, guard)
-                speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
                 self.acquire_count = 0
@@ -1122,7 +1141,6 @@ class LaneFollowNode(Node):
             else:
                 speed, steer, d_error = self.compute_pid_control(error)
                 speed = min(speed, self.acquire_speed_limit)
-                speed, steer = self.apply_line_guard(speed, steer, guard)
                 speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
@@ -1196,7 +1214,6 @@ class LaneFollowNode(Node):
 
                 speed, steer = self.directed_lost_search_control()
                 speed, steer = self.apply_line_guard(speed, steer, guard)
-                speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
                 self.draw_text(
@@ -1250,7 +1267,6 @@ class LaneFollowNode(Node):
                         self.lane_center_est = 0.90 * self.lane_center_est + 0.10 * center_now
 
                 speed, steer, d_error = self.compute_pid_control(error)
-                speed, steer = self.apply_line_guard(speed, steer, guard)
                 speed, steer = self.apply_line_guard(speed, steer, guard)
                 self.publish_cmd(speed, steer)
 
